@@ -1,97 +1,212 @@
+// controller.c
+// Robust controller: launches scanners, makes each scanner child a session leader so entire
+// scanner|memory_core pipeline can be killed by killing the session, and ensures all scanner
+// pipelines are terminated when the controller is suspended (Ctrl-Z) or stopped.
+//
+// Place this file at: scarecrow/controller/controller.c
+
+#define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include <pthread.h>
 
 #define INTERVAL 30
-#define MEMORY_CORE "../memory/memory_core_cli"    // memory core executable
-#define BASE_DIR "../memory/memory_store"          // scans stored inside memory/memory_store
+#define MEMORY_CORE "../memory/memory_core_cli"
+#define BASE_DIR "../memory/memory_store"
 #define SCANNERS_CONF "scanners.conf"
-#define RETENTION_DAYS 7
-#define MAX_SCANS 5000
+#define RETENTION_MINUTES 10
+#define CLEAN_INTERVAL_SECONDS (RETENTION_MINUTES * 60)
 #define MAX_LINE 1024
-#define MAX_SCANNERS 64
+#define MAX_SCANNERS 128
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 typedef struct {
-    char host[64];
-    char type[64];
-    char severity[8];
-    char cmd[512];
+    char host[128];
+    char type[128];
+    char severity[16];
+    char cmd[1024];
+    pid_t pid;     /* child PID (session leader) */
 } scanner_t;
 
-int load_scanners(scanner_t *arr, int max) {
+static volatile sig_atomic_t stop_requested = 0;
+static scanner_t scanners[MAX_SCANNERS];
+static int scanner_count = 0;
+
+/* Async-signal-safe: send SIGTERM to all known scanner process groups */
+static void kill_all_scanners_sigsafe(void) {
+    for (int i = 0; i < scanner_count; ++i) {
+        pid_t p = scanners[i].pid;
+        if (p > 0) {
+            kill(-p, SIGTERM); /* negative pid = process group */
+        }
+    }
+}
+
+/* Normal shutdown: SIGTERM then SIGKILL if needed */
+static void kill_all_scanners(void) {
+    for (int i = 0; i < scanner_count; ++i) {
+        pid_t p = scanners[i].pid;
+        if (p > 0) kill(-p, SIGTERM);
+    }
+    sleep(1);
+    for (int i = 0; i < scanner_count; ++i) {
+        pid_t p = scanners[i].pid;
+        if (p > 0) kill(-p, SIGKILL);
+    }
+}
+
+/* Signal handlers */
+static void handle_term(int sig) { (void)sig; stop_requested = 1; }
+
+/* On Ctrl-Z (SIGTSTP), kill scanner pipelines immediately (signal-safe) then stop this process */
+static void handle_tstp(int sig) {
+    (void)sig;
+    kill_all_scanners_sigsafe();
+    raise(SIGSTOP);
+}
+
+/* Load scanners.conf (format: host|type|severity|executable_name) */
+static int load_scanners(void) {
     FILE *f = fopen(SCANNERS_CONF, "r");
     if (!f) {
-        fprintf(stderr, "Failed to open %s\n", SCANNERS_CONF);
+        fprintf(stderr, "Failed to open %s: %s\n", SCANNERS_CONF, strerror(errno));
         return 0;
     }
-
     char line[MAX_LINE];
     int count = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (line[0]=='#' || line[0]=='\n') continue;
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\n' || *s == '\0') continue;
         line[strcspn(line, "\n")] = 0;
-
         char *host = strtok(line, "|");
         char *type = strtok(NULL, "|");
         char *sev  = strtok(NULL, "|");
         char *cmd  = strtok(NULL, "|");
         if (!host || !type || !sev || !cmd) continue;
-
-        strncpy(arr[count].host, host, sizeof(arr[count].host)-1);
-        strncpy(arr[count].type, type, sizeof(arr[count].type)-1);
-        strncpy(arr[count].severity, sev, sizeof(arr[count].severity)-1);
-
-        // prefix scanner command with relative path
-        char scanner_path[512];
-        snprintf(scanner_path, sizeof(scanner_path), "../scanner/%s", cmd);
-        strncpy(arr[count].cmd, scanner_path, sizeof(arr[count].cmd)-1);
-
+        strncpy(scanners[count].host, host, sizeof(scanners[count].host)-1);
+        scanners[count].host[sizeof(scanners[count].host)-1] = '\0';
+        strncpy(scanners[count].type, type, sizeof(scanners[count].type)-1);
+        scanners[count].type[sizeof(scanners[count].type)-1] = '\0';
+        strncpy(scanners[count].severity, sev, sizeof(scanners[count].severity)-1);
+        scanners[count].severity[sizeof(scanners[count].severity)-1] = '\0';
+        snprintf(scanners[count].cmd, sizeof(scanners[count].cmd), "../scanner/%s", cmd);
+        scanners[count].cmd[sizeof(scanners[count].cmd)-1] = '\0';
+        scanners[count].pid = 0;
         count++;
-        if (count >= max) break;
+        if (count >= MAX_SCANNERS) break;
     }
     fclose(f);
+    scanner_count = count;
     return count;
 }
 
-int main() {
-    // ensure memory_store inside memory exists
-    mkdir(BASE_DIR, 0755);
+/* Optional: periodic cleanup thread that wipes BASE_DIR every CLEAN_INTERVAL_SECONDS */
+static void *cleanup_thread_fn(void *arg) {
+    const char *base = (const char *)arg;
+    for (;;) {
+        sleep(CLEAN_INTERVAL_SECONDS);
+        char cmd[PATH_MAX + 256];
+        snprintf(cmd, sizeof(cmd),
+                 "sh -c 'rm -rf \"%s\"/* \"%s\"/.[!.]* \"%s\"/..?*' 2>/dev/null || true",
+                 base, base, base);
+        system(cmd);
+        if (access(base, F_OK) != 0) mkdir(base, 0755);
+        fprintf(stdout, "[CLEANUP] wiped %s\n", base);
+        fflush(stdout);
+    }
+    return NULL;
+}
 
-    scanner_t scanners[MAX_SCANNERS];
-    int n = load_scanners(scanners, MAX_SCANNERS);
-    if (n==0) {
-        fprintf(stderr,"No scanners found in %s\n", SCANNERS_CONF);
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_term;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    struct sigaction st;
+    memset(&st, 0, sizeof(st));
+    st.sa_handler = handle_tstp;
+    sigaction(SIGTSTP, &st, NULL);
+
+    if (mkdir(BASE_DIR, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "mkdir %s failed: %s\n", BASE_DIR, strerror(errno));
+    }
+
+    if (load_scanners() == 0) {
+        fprintf(stderr, "No scanners found in %s\n", SCANNERS_CONF);
         return 1;
     }
 
-    while (1) {
-        for (int i=0;i<n;i++) {
+    /* start cleanup thread (optional) */
+    pthread_t cleaner;
+    if (pthread_create(&cleaner, NULL, cleanup_thread_fn, (void *)BASE_DIR) == 0) {
+        pthread_detach(cleaner);
+    }
+
+    while (!stop_requested) {
+        /* spawn each scanner as a child session leader so pipeline can be killed by killing -pid */
+        for (int i = 0; i < scanner_count && !stop_requested; ++i) {
             pid_t pid = fork();
-            if (pid==0) {
-                // child process: scanner | memory_core_cli
-                char mem_args[512];
+            if (pid < 0) {
+                fprintf(stderr, "fork failed for %s\n", scanners[i].cmd);
+                scanners[i].pid = 0;
+                continue;
+            }
+            if (pid == 0) {
+                /* child: create new session */
+                setsid(); /* ignore errors */
+                char mem_args[1024];
                 snprintf(mem_args, sizeof(mem_args),
-                    "--host %s --type %s --severity %s --base-dir %s --retention-days %d --max-scans %d",
-                    scanners[i].host, scanners[i].type, scanners[i].severity,
-                    BASE_DIR, RETENTION_DAYS, MAX_SCANS);
-
-                char full_cmd[1024];
+                         "--host %s --type %s --severity %s --base-dir %s --retention-minutes %d",
+                         scanners[i].host, scanners[i].type, scanners[i].severity,
+                         BASE_DIR, RETENTION_MINUTES);
+                char full_cmd[2048];
                 snprintf(full_cmd, sizeof(full_cmd), "%s | %s %s", scanners[i].cmd, MEMORY_CORE, mem_args);
-                execlp("sh", "sh", "-c", full_cmd, NULL);
+                execlp("sh", "sh", "-c", full_cmd, (char *)NULL);
+                _exit(127);
+            }
+            /* parent records child pid (session leader) */
+            scanners[i].pid = pid;
+        }
 
-                perror("execlp failed");
-                exit(1);
+        /* wait for children (non-blocking) until they finish or stop requested */
+        int remaining = 0;
+        for (int i = 0; i < scanner_count; ++i) if (scanners[i].pid > 0) remaining++;
+        while (remaining > 0 && !stop_requested) {
+            pid_t w = waitpid(-1, NULL, WNOHANG);
+            if (w > 0) {
+                for (int i = 0; i < scanner_count; ++i) {
+                    if (scanners[i].pid == w) {
+                        scanners[i].pid = 0;
+                        remaining--;
+                        break;
+                    }
+                }
+            } else {
+                sleep(1);
             }
         }
 
-        // wait for all child processes
-        while(wait(NULL) > 0);
+        if (stop_requested) break;
 
-        sleep(INTERVAL);
+        for (int s = 0; s < INTERVAL && !stop_requested; ++s) sleep(1);
     }
+
+    /* on shutdown: ensure all scanner groups are terminated */
+    kill_all_scanners();
+
+    /* reap any remaining children */
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
 
     return 0;
 }
