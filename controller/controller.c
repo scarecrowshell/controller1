@@ -1,9 +1,6 @@
 // controller.c
-// Robust controller: launches scanners, makes each scanner child a session leader so entire
-// scanner|memory_core pipeline can be killed by killing the session, and ensures all scanner
-// pipelines are terminated when the controller is suspended (Ctrl-Z) or stopped.
-//
-// Place this file at: scarecrow/controller/controller.c
+// Robust controller (updated): replaces usleep() with nanosleep() and adds missing headers.
+// Place at: scarecrow/controller/controller.c
 
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
@@ -15,6 +12,10 @@
 #include <signal.h>
 #include <errno.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <limits.h>
+#include <ctype.h>
+#include <time.h>
 
 #define INTERVAL 30
 #define MEMORY_CORE "../memory/memory_core_cli"
@@ -24,9 +25,6 @@
 #define CLEAN_INTERVAL_SECONDS (RETENTION_MINUTES * 60)
 #define MAX_LINE 1024
 #define MAX_SCANNERS 128
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
 
 typedef struct {
     char host[128];
@@ -37,43 +35,23 @@ typedef struct {
 } scanner_t;
 
 static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t cleanup_requested = 0; /* set by SIGTSTP handler */
 static scanner_t scanners[MAX_SCANNERS];
 static int scanner_count = 0;
 
-/* Async-signal-safe: send SIGTERM to all known scanner process groups */
-static void kill_all_scanners_sigsafe(void) {
-    for (int i = 0; i < scanner_count; ++i) {
-        pid_t p = scanners[i].pid;
-        if (p > 0) {
-            kill(-p, SIGTERM); /* negative pid = process group */
-        }
-    }
-}
+/* forward */
+static void kill_all_scanners(void);
+static void robust_scan_and_kill_stragglers(void);
 
-/* Normal shutdown: SIGTERM then SIGKILL if needed */
-static void kill_all_scanners(void) {
-    for (int i = 0; i < scanner_count; ++i) {
-        pid_t p = scanners[i].pid;
-        if (p > 0) kill(-p, SIGTERM);
-    }
-    sleep(1);
-    for (int i = 0; i < scanner_count; ++i) {
-        pid_t p = scanners[i].pid;
-        if (p > 0) kill(-p, SIGKILL);
-    }
-}
-
-/* Signal handlers */
+/* signal handlers (async-signal-safe actions only) */
 static void handle_term(int sig) { (void)sig; stop_requested = 1; }
-
-/* On Ctrl-Z (SIGTSTP), kill scanner pipelines immediately (signal-safe) then stop this process */
 static void handle_tstp(int sig) {
     (void)sig;
-    kill_all_scanners_sigsafe();
-    raise(SIGSTOP);
+    /* request cleanup in main loop (do NOT perform heavy ops here) */
+    cleanup_requested = 1;
 }
 
-/* Load scanners.conf (format: host|type|severity|executable_name) */
+/* Load scanners.conf */
 static int load_scanners(void) {
     FILE *f = fopen(SCANNERS_CONF, "r");
     if (!f) {
@@ -109,6 +87,81 @@ static int load_scanners(void) {
     return count;
 }
 
+/* Normal shutdown: SIGTERM then SIGKILL to process groups */
+static void kill_all_scanners(void) {
+    for (int i = 0; i < scanner_count; ++i) {
+        pid_t p = scanners[i].pid;
+        if (p > 0) kill(-p, SIGTERM);
+    }
+    sleep(1);
+    for (int i = 0; i < scanner_count; ++i) {
+        pid_t p = scanners[i].pid;
+        if (p > 0) kill(-p, SIGKILL);
+    }
+}
+
+/* Robust scan of /proc to find stray scanner or memory_core_cli processes and kill them.
+   This runs in main context (not in signal handler) so it can do I/O. */
+static void robust_scan_and_kill_stragglers(void) {
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    struct dirent *e;
+    char exe_path[PATH_MAX];
+    struct timespec ts = {0, 100000000}; /* 100ms */
+
+    while ((e = readdir(d)) != NULL) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        pid_t pid = (pid_t)atoi(e->d_name);
+        if (pid <= 1) continue;
+
+        /* skip if this pid is one of the known session leaders we already killed */
+        int known = 0;
+        for (int i = 0; i < scanner_count; ++i) {
+            if (scanners[i].pid == pid) { known = 1; break; }
+            if (scanners[i].pid > 0) {
+                pid_t pg = getpgid(pid);
+                pid_t spg = getpgid(scanners[i].pid);
+                if (pg != -1 && spg != -1 && pg == spg) { known = 1; break; }
+            }
+        }
+        if (known) continue;
+
+        /* read /proc/<pid>/exe */
+        char link[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/%d/exe", pid);
+        ssize_t r = readlink(link, exe_path, sizeof(exe_path)-1);
+        if (r <= 0) continue;
+        exe_path[r] = '\0';
+
+        /* if executable path contains scanner dir or memory_core_cli, kill it */
+        if (strstr(exe_path, "/scarecrow/scanner/") != NULL ||
+            strstr(exe_path, "/scarecrow/memory/memory_core_cli") != NULL ||
+            strstr(exe_path, "memory_core_cli") != NULL) {
+            kill(pid, SIGTERM);
+            nanosleep(&ts, NULL);
+            if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+            continue;
+        }
+
+        /* also check cmdline for references */
+        char cmdline_path[PATH_MAX];
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", pid);
+        FILE *cf = fopen(cmdline_path, "r");
+        if (cf) {
+            char buf[4096];
+            size_t len = fread(buf, 1, sizeof(buf)-1, cf);
+            fclose(cf);
+            buf[len] = '\0';
+            if (strstr(buf, "scanner_") || strstr(buf, "memory_core_cli") || strstr(buf, "scarecrow/scanner")) {
+                kill(pid, SIGTERM);
+                nanosleep(&ts, NULL);
+                if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+            }
+        }
+    }
+    closedir(d);
+}
+
 /* Optional: periodic cleanup thread that wipes BASE_DIR every CLEAN_INTERVAL_SECONDS */
 static void *cleanup_thread_fn(void *arg) {
     const char *base = (const char *)arg;
@@ -139,7 +192,7 @@ int main(void) {
     sigaction(SIGTSTP, &st, NULL);
 
     if (mkdir(BASE_DIR, 0755) != 0 && errno != EEXIST) {
-        fprintf(stderr, "mkdir %s failed: %s\n", BASE_DIR, strerror(errno));
+        /* continue */
     }
 
     if (load_scanners() == 0) {
@@ -179,6 +232,17 @@ int main(void) {
             scanners[i].pid = pid;
         }
 
+        /* If a suspend was requested (SIGTSTP), perform robust cleanup BEFORE actually suspending */
+        if (cleanup_requested) {
+            /* normal graceful kills for known groups */
+            kill_all_scanners();
+            /* then scan /proc for any stray scanner/memory_core processes and kill them */
+            robust_scan_and_kill_stragglers();
+            /* reset flag and actually suspend controller process now */
+            cleanup_requested = 0;
+            raise(SIGSTOP); /* actually suspend after cleanup */
+        }
+
         /* wait for children (non-blocking) until they finish or stop requested */
         int remaining = 0;
         for (int i = 0; i < scanner_count; ++i) if (scanners[i].pid > 0) remaining++;
@@ -204,6 +268,9 @@ int main(void) {
 
     /* on shutdown: ensure all scanner groups are terminated */
     kill_all_scanners();
+
+    /* final sweep for stray processes */
+    robust_scan_and_kill_stragglers();
 
     /* reap any remaining children */
     while (waitpid(-1, NULL, WNOHANG) > 0) {}
